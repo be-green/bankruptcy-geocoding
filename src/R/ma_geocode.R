@@ -2,7 +2,7 @@ library(data.table)
 library(tidygeocoder)
 library(stringr)
 library(future)
-library(furrr)
+library(future.apply)
 
 # get our parallelism going
 future::plan(multisession)
@@ -18,7 +18,7 @@ geocode_address_file <- function(address_df) {
   # 10k seems to take ~40 seconds
   num_loop_chunks = nrow(address_df) %/% 10000 + 1
   
-  address_list<- future_map(1:num_loop_chunks, function(i) {
+  address_list <- future_lapply(1:num_loop_chunks, function(i) {
     
     # go through addresses in 10k chunks
     start_num = (i - 1) * 10000 + 1
@@ -41,7 +41,7 @@ geocode_address_file <- function(address_df) {
                      method = "census",
                      api_options =
                        list(census_return_type = "geographies")
-                     )
+    )
     coded <- as.data.table(coded)
     message("Chunk ", i, " ", 
             nrow(coded[!is.na(lat)]) / 10000 * 100, 
@@ -54,100 +54,110 @@ geocode_address_file <- function(address_df) {
   rbindlist(address_list)
 }
 
-addresses <- fread("data/MA.csv")
+# get states to loop over
+# this is built into R
+states <- state.abb
 
-start <- proc.time()
-geocoded_addresses <- geocode_address_file(addresses)
-end <- proc.time()
+for(state in states) {
+  
+  message("Starting ", state)
+  
+  addresses <- fread(paste0("data/arcgis_splits_by_state/",state,".csv"))
+  
+  start <- proc.time()
+  geocoded_addresses <- geocode_address_file(addresses)
+  end <- proc.time()
+  
+  end - start
+  
+  # we are happy with these (for mass it's ~62k / 77k)
+  # let's move on to the misses
+  matches <- geocoded_addresses[match_indicator == "Match"]
+  
+  # of the 15k misses, po boxes are a large chunk
+  # let's analyze those separately
+  # because we might have to make some choices
+  po_boxes <- geocoded_addresses[str_detect(input_address, "PO BOX") & 
+                                   (is.na(match_indicator) |
+                                      match_indicator != "Match")]
+  
+  # census reports NAs when there are ties which is strange
+  # these tend to be in a different class than the non-matches
+  # there are ~800 of these 
+  # the rest are straight up misses
+  # both tend to have lots of apartments and special characters
+  other_misses <- 
+    geocoded_addresses[!str_detect(input_address, "PO BOX") & 
+                         (is.na(match_indicator) |
+                            match_indicator != "Match")]
+  
+  # some of these have apartment numbers
+  # i'm going to remove those because they might be preventing matches
+  # there are ~815 of those or a little more than 1% of the full sample
+  other_misses[, Debtor1_address1 := str_to_upper(Debtor1_address1)]
+  other_misses[, Debtor1_address1 := str_replace_all(Debtor1_address1,
+                                                     "APT [0-9-]+", "")]
+  other_misses[, Debtor1_address1 := str_replace_all(Debtor1_address1,
+                                                     "Unit [0-9-]+", "")]
+  
+  # some of the misses have special characters that could be messing things
+  # up (e.g. 1/2, #4, 32-34)
+  # i'm removing the 1/2's assuming that they should be part of 
+  # a building with the whole number,
+  # and just taking the first part of any address with a range
+  # I think this should be pretty safe, but want to be clear about 
+  # choices
+  other_misses[, Debtor1_address1 := str_replace_all(Debtor1_address1, 
+                                                     "1/2", "")]
+  other_misses[, Debtor1_address1 := str_replace_all(Debtor1_address1, 
+                                                     "#", "")]
+  other_misses[, Debtor1_address1 := str_replace_all(Debtor1_address1, 
+                                                     "-[0-9]+", "")]
+  # several of the zipcodes got miscoded somehow
+  # and ended up with the form 123456789.0 when originally
+  # I think they were a 9 digit zip
+  other_misses[, Debtor1_zip := str_replace_all(Debtor1_zip, 
+                                                fixed(".0"),
+                                                "")]
+  
+  # prep for re-geocoding
+  other_misses <- other_misses[,.SD, .SDcols = colnames(addresses)]
+  
+  # re-geocode, this gets rid of ~9k misses
+  other_misses <- geocode_address_file(other_misses)
+  
+  # combine stuff
+  matches <- rbind(
+    matches,
+    other_misses[match_indicator == "Match"],
+    fill = T
+  )
+  
+  # get new misses
+  other_misses <- other_misses[match_indicator != "Match"]
+  
+  # all matches vs. all misses
+  num_matches <- nrow(matches)
+  num_misses <- nrow(rbind(
+    other_misses,
+    po_boxes,
+    fill = T
+  ))
+  
+  message("Match rate: ", 
+          round(num_matches / (num_matches + num_misses) * 100),
+          "%")
+  
+  message("Match rate, without considering ties and PO Boxes: ", 
+          round(num_matches / (num_matches + nrow(other_misses)) * 100),
+          "%")
+  
+  fwrite(matches, file = paste0("data/", state, "matches.csv"))
+  
+  fwrite(rbind(
+    other_misses,
+    po_boxes,
+    fill = T
+  ), file = paste0("data/", state, "_misses.csv"))
+}
 
-end - start
-
-# we are happy with these (for mass it's ~62k / 77k)
-# let's move on to the misses
-matches <- geocoded_addresses[match_indicator == "Match"]
-
-# of the 15k misses, po boxes are a large chunk
-# let's analyze those separately
-# because we might have to make some choices
-po_boxes <- geocoded_addresses[str_detect(input_address, "PO BOX") & 
-                                 (is.na(match_indicator) |
-                                    match_indicator != "Match")]
-
-# census reports NAs when there are ties which is strange
-# these tend to be in a different class than the non-matches
-# there are ~800 of these 
-# the rest are straight up misses
-# both tend to have lots of apartments and special characters
-other_misses <- 
-  geocoded_addresses[!str_detect(input_address, "PO BOX") & 
-                                 (is.na(match_indicator) |
-                                    match_indicator != "Match")]
-
-# some of these have apartment numbers
-# i'm going to remove those because they might be preventing matches
-# there are ~815 of those or a little more than 1% of the full sample
-other_misses[, Debtor1_address1 := str_to_upper(Debtor1_address1)]
-other_misses[, Debtor1_address1 := str_replace_all(Debtor1_address1,
-                                                   "APT [0-9-]+", "")]
-other_misses[, Debtor1_address1 := str_replace_all(Debtor1_address1,
-                                                   "Unit [0-9-]+", "")]
-
-# some of the misses have special characters that could be messing things
-# up (e.g. 1/2, #4, 32-34)
-# i'm removing the 1/2's assuming that they should be part of 
-# a building with the whole number,
-# and just taking the first part of any address with a range
-# I think this should be pretty safe, but want to be clear about 
-# choices
-other_misses[, Debtor1_address1 := str_replace_all(Debtor1_address1, 
-                                                   "1/2", "")]
-other_misses[, Debtor1_address1 := str_replace_all(Debtor1_address1, 
-                                                   "#", "")]
-other_misses[, Debtor1_address1 := str_replace_all(Debtor1_address1, 
-                                                   "-[0-9]+", "")]
-# several of the zipcodes got miscoded somehow
-# and ended up with the form 123456789.0 when originally
-# I think they were a 9 digit zip
-other_misses[, Debtor1_zip := str_replace_all(Debtor1_zip, 
-                                              fixed(".0"),
-                                              "")]
-
-# prep for re-geocoding
-other_misses <- other_misses[,.SD, .SDcols = colnames(addresses)]
-
-# re-geocode, this gets rid of ~9k misses
-other_misses <- geocode_address_file(other_misses)
-
-# combine stuff
-matches <- rbind(
-  matches,
-  other_misses[match_indicator == "Match"],
-  fill = T
-)
-
-# get new misses
-other_misses <- other_misses[match_indicator != "Match"]
-
-# all matches vs. all misses
-num_matches <- nrow(matches)
-num_misses <- nrow(rbind(
-  other_misses,
-  po_boxes,
-  fill = T
-))
-
-message("Match rate: ", 
-        round(num_matches / (num_matches + num_misses) * 100),
-        "%")
-
-message("Match rate, without considering ties and PO Boxes: ", 
-        round(num_matches / (num_matches + nrow(other_misses)) * 100),
-        "%")
-
-fwrite(matches, file = "data/matches.csv")
-
-fwrite(rbind(
-  other_misses,
-  po_boxes,
-  fill = T
-), file = "data/misses.csv")
